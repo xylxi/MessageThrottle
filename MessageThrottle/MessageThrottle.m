@@ -87,6 +87,7 @@ static pthread_mutex_t mutex;
                 && object_isClass(obj.target)) {
                 Class clsA = rule.target;
                 Class clsB = obj.target;
+                // 如果同时 hook 了基类和子类的同一个方法，且子类调用了基类的方法，就会导致循环调用。因为调用 super 方法时，传入的 target 还是 self 对象，导致调用了子类的方法。好在这里并不允许同时 hook 一条继承链上的两个类，因为子类和基类限制频率的规则会相互干扰，导致不易发现的 bug。
                 shouldApply = !([clsA isSubclassOfClass:clsB] || [clsB isSubclassOfClass:clsA]);
                 *stop = shouldApply;
                 NSString *errorDescription = [NSString stringWithFormat:@"Error: %@ already apply rule in %@. A message can only have one throttle per class hierarchy.", NSStringFromSelector(obj.selector), NSStringFromClass(clsB)];
@@ -186,7 +187,7 @@ static void mt_handleInvocation(NSInvocation *invocation, SEL fixedSelector)
     }
     
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-
+    // 可以注意到- (void)retainArguments;这个方法，它会将传入的所有参数以及target都retain一遍
     switch (rule.mode) {
         case MTPerformModeFirstly:
             if (now - rule.lastTimeRequest > rule.durationThreshold) {
@@ -203,6 +204,7 @@ static void mt_handleInvocation(NSInvocation *invocation, SEL fixedSelector)
                 });
             }
             else {
+                // 替换成新的Invocation
                 invocation.selector = fixedSelector;
                 rule.lastInvocation = invocation;
                 [rule.lastInvocation retainArguments];
@@ -226,6 +228,8 @@ static void mt_forwardInvocation(__unsafe_unretained id assignSlf, SEL selector,
     SEL originalSelector = invocation.selector;
     SEL fixedOriginalSelector = mt_aliasForSelector(object_getClass(assignSlf), originalSelector);
     if (![assignSlf respondsToSelector:fixedOriginalSelector]) {
+        // 如果没有响应，说明该方法没有进行hook，而且走到这里了
+        // 还是走系统默认消息转发实现
         mt_executeOrigForwardInvocation(assignSlf, selector, invocation);
         return;
     }
@@ -250,7 +254,7 @@ static void mt_overrideMethod(id target, SEL selector)
         return;
     }
     const char *originType = (char *)method_getTypeEncoding(originMethod);
-    
+    // 判断某个类是否实现了实例方法
     IMP originalImp = class_respondsToSelector(cls, selector) ? class_getMethodImplementation(cls, selector) : NULL;
     
     IMP msgForwardIMP = _objc_msgForward;
@@ -263,6 +267,7 @@ static void mt_overrideMethod(id target, SEL selector)
         // https://github.com/ReactiveCocoa/ReactiveCocoa/issues/783
         // http://infocenter.arm.com/help/topic/com.arm.doc.ihi0042e/IHI0042E_aapcs.pdf (Section 5.4)
         //NSMethodSignature knows the detail but has no API to return, we can only get the info from debugDescription.
+        // 从方法签名中的debugDescription属性，判断返回的是不是结构体
         NSMethodSignature *methodSignature = [NSMethodSignature signatureWithObjCTypes:originType];
         if ([methodSignature.debugDescription rangeOfString:@"is special struct return? YES"].location != NSNotFound) {
             msgForwardIMP = (IMP)_objc_msgForward_stret;
@@ -271,12 +276,17 @@ static void mt_overrideMethod(id target, SEL selector)
 #endif
     
     if (originalImp == msgForwardIMP) {
+        // 如果相等，说明已经hook过了
         return;
     }
     
     if (class_getMethodImplementation(cls, @selector(forwardInvocation:)) != (IMP)mt_forwardInvocation) {
+        // 判断该类的 forwardInvocation 是否被 hook 过，没有就进行 hook
+        
+        // 先替换系统的实现
         IMP originalForwardImp = class_replaceMethod(cls, @selector(forwardInvocation:), (IMP)mt_forwardInvocation, "v@:@");
         if (originalForwardImp) {
+            // 将系统的实现给 MTForwardInvocationSelectorName
             class_addMethod(cls, NSSelectorFromString(MTForwardInvocationSelectorName), originalForwardImp, "v@:@");
         }
     }
@@ -333,8 +343,9 @@ static void mt_recoverMethod(id target, SEL selector)
 static void mt_executeOrigForwardInvocation(id slf, SEL selector, NSInvocation *invocation)
 {
     SEL origForwardSelector = NSSelectorFromString(MTForwardInvocationSelectorName);
-    
+
     if ([slf respondsToSelector:origForwardSelector]) {
+        // 如果被类实现了 forwardSelector 方法，那么走本类的
         NSMethodSignature *methodSignature = [slf methodSignatureForSelector:origForwardSelector];
         if (!methodSignature) {
             NSString *assertLog = [NSString stringWithFormat:@"unrecognized selector -%@ for instance %@", NSStringFromSelector(origForwardSelector), slf];
